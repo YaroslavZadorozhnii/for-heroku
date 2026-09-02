@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Anti-Spoofing Navigator (Local Dev)</title>
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.css" />
+
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            width: 100%;
+            font-family: Arial, sans-serif;
+            overflow: hidden;
+        }
+        #map {
+            height: 100%;
+            width: 100%;
+        }
+        #status-card {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 10px 14px;
+            border-radius: 8px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+            font-size: 13px;
+            pointer-events: none;
+        }
+        .status-dot {
+            height: 10px;
+            width: 10px;
+            background-color: #bbb;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 5px;
+        }
+        .status-online { background-color: #2ecc71; }
+        .status-offline { background-color: #e74c3c; }
+
+        /* Блок пошуку адреси */
+        #search-container {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 1000;
+            width: 280px;
+            max-width: calc(100% - 160px);
+        }
+        #search-input {
+            width: 100%;
+            padding: 10px 14px;
+            border: none;
+            border-radius: 8px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+            font-size: 14px;
+            outline: none;
+            box-sizing: border-box;
+            background: #ffffff;
+        }
+        #search-results {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: #ffffff;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            margin-top: 5px;
+            max-height: 250px;
+            overflow-y: auto;
+            display: none;
+            z-index: 1001;
+        }
+        .search-item {
+            padding: 10px 12px;
+            font-size: 13px;
+            cursor: pointer;
+            border-bottom: 1px solid #eee;
+            color: #333;
+        }
+        .search-item:last-child {
+            border-bottom: none;
+        }
+        .search-item:hover {
+            background-color: #f0f4f9;
+        }
+
+        /* Нижній блок керування навігатором */
+        #nav-controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+            display: none;
+        }
+        .btn-nav {
+            background-color: #0066ff;
+            color: white;
+            border: none;
+            padding: 14px 28px;
+            font-size: 16px;
+            font-weight: bold;
+            border-radius: 30px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+            cursor: pointer;
+            transition: background-color 0.2s, transform 0.1s;
+        }
+        .btn-nav:active {
+            transform: scale(0.96);
+        }
+        .btn-stop {
+            background-color: #e74c3c;
+        }
+
+        /* SVG Маркер Стрілка */
+        .navigation-arrow-icon {
+            transition: transform 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+
+<div id="status-card">
+    <div><span id="status-dot" class="status-dot status-offline"></span><strong id="status-text">Підключення...</strong></div>
+    <div>Точність: <span id="accuracy-val">--</span> м</div>
+    <div style="margin-top: 5px; color: #555;" id="hint-text"><i>Торкніться карти або введіть адресу</i></div>
+</div>
+
+<div id="search-container">
+    <input type="text" id="search-input" placeholder="Пошук адреси..." autocomplete="off" />
+    <div id="search-results"></div>
+</div>
+
+<div id="nav-controls">
+    <button id="nav-btn" class="btn-nav" onclick="toggleNavigation()">Почати рух</button>
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-routing-machine@3.2.12/dist/leaflet-routing-machine.js"></script>
+
+<script>
+    const map = L.map('map', {
+        tap: !L.Browser.mobile
+    }).setView([50.4501, 30.5234], 13);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+
+    let userMarker = null;
+    let accuracyCircle = null;
+    let routingControl = null;
+    let destinationMarker = null;
+    let currentLat = null;
+    let currentLng = null;
+    let isNavigationActive = false;
+    let hasReceivedFirstRealFix = false;
+    let currentHeading = 0; // Напрямок руху у градусах
+    let searchDebounceTimer = null;
+
+    // HTML SVG для маркера-стрілки навігації
+    function createArrowIcon(heading = 0) {
+        return L.divIcon({
+            className: 'navigation-arrow-wrapper',
+            html: `
+                <div class="navigation-arrow-icon" style="transform: rotate(${heading}deg); width: 36px; height: 36px;">
+                    <svg viewBox="0 0 100 100" width="36" height="36">
+                        <circle cx="50" cy="50" r="45" fill="#0066ff" stroke="#ffffff" stroke-width="8"/>
+                        <path d="M50 15 L75 75 L50 60 L25 75 Z" fill="#ffffff" />
+                    </svg>
+                </div>
+            `,
+            iconSize: [36, 36],
+            iconAnchor: [18, 18]
+        });
+    }
+
+    // Обчислення азимуту (кута) між двома координатами
+    function calculateHeading(lat1, lon1, lat2, lon2) {
+        const dLon = (lon2 - lon1) * Math.PI / 180;
+        const lat1Rad = lat1 * Math.PI / 180;
+        const lat2Rad = lat2 * Math.PI / 180;
+        const y = Math.sin(dLon) * Math.cos(lat2Rad);
+        const x = Math.cos(lat1Rad) * Math.sin(lat2Rad) - Math.sin(lat1Rad) * Math.cos(lat2Rad) * Math.cos(dLon);
+        let brng = Math.atan2(y, x) * 180 / Math.PI;
+        return (brng + 360) % 360;
+    }
+
+    function updateUserPosition(lat, lng, accuracy, status) {
+        const latLng = [lat, lng];
+
+        // Розрахунок курсу руху, якщо є попередні координати
+        if (currentLat !== null && currentLng !== null && (currentLat !== lat || currentLng !== lng)) {
+            currentHeading = calculateHeading(currentLat, currentLng, lat, lng);
+        }
+
+        currentLat = lat;
+        currentLng = lng;
+
+        // При першому отриманні дійсної локації (окрім дефолтного очікування)
+        if (!hasReceivedFirstRealFix && (status === 'ok' || status === 'demo' || accuracy < 500)) {
+            map.setView(latLng, 17, { animate: true });
+            hasReceivedFirstRealFix = true;
+        }
+
+        if (!userMarker) {
+            // Створюємо маркер у вигляді стрілки
+            userMarker = L.marker(latLng, { icon: createArrowIcon(currentHeading) }).addTo(map);
+
+            accuracyCircle = L.circle(latLng, {
+                radius: accuracy,
+                color: '#0066ff',
+                opacity: 0.3,
+                fillOpacity: 0.1,
+                interactive: false
+            }).addTo(map);
+        } else {
+            userMarker.setLatLng(latLng);
+            userMarker.setIcon(createArrowIcon(currentHeading));
+            accuracyCircle.setLatLng(latLng);
+            accuracyCircle.setRadius(accuracy);
+        }
+
+        // Якщо активовано режим навігації — тримаємо маркер точно в центрі
+        if (isNavigationActive) {
+            map.panTo(latLng, { animate: true, duration: 0.8 });
+        }
+
+        // Оновлюємо початкову точку маршруту
+        if (routingControl) {
+            const waypoints = routingControl.getWaypoints();
+            if (waypoints && waypoints.length > 0 && waypoints[0].latLng) {
+                routingControl.setWaypoints([
+                    L.latLng(lat, lng),
+                    waypoints[waypoints.length - 1].latLng
+                ]);
+            }
+        }
+    }
+
+    function buildRoute(targetLatLng) {
+        const startLat = currentLat || 50.4501;
+        const startLng = currentLng || 30.5234;
+
+        clearRouteAndDestination();
+
+        destinationMarker = L.marker(targetLatLng, { draggable: true }).addTo(map);
+        destinationMarker.on('dragend', function(e) {
+            buildRoute(e.target.getLatLng());
+        });
+
+        routingControl = L.Routing.control({
+            waypoints: [
+                L.latLng(startLat, startLng),
+                targetLatLng
+            ],
+            routeWhileDragging: false,
+            addWaypoints: false,
+            createMarker: function() { return null; },
+            lineOptions: {
+                styles: [{ color: '#0066ff', opacity: 0.85, weight: 6 }]
+            },
+            show: false
+        }).addTo(map);
+
+        // Показуємо кнопку початку руху
+        document.getElementById('nav-controls').style.display = 'block';
+    }
+
+    function clearRouteAndDestination() {
+        if (routingControl) {
+            map.removeControl(routingControl);
+            routingControl = null;
+        }
+        if (destinationMarker) {
+            map.removeLayer(destinationMarker);
+            destinationMarker = null;
+        }
+    }
+
+    function resetNavigationState() {
+        isNavigationActive = false;
+        clearRouteAndDestination();
+
+        const navBtn = document.getElementById('nav-btn');
+        navBtn.innerText = 'Почати рух';
+        navBtn.classList.remove('btn-stop');
+
+        document.getElementById('nav-controls').style.display = 'none';
+        document.getElementById('hint-text').innerText = 'Торкніться карти або введіть адресу';
+    }
+
+    function toggleNavigation() {
+        const navBtn = document.getElementById('nav-btn');
+
+        if (!isNavigationActive) {
+            isNavigationActive = true;
+            navBtn.innerText = 'Завершити';
+            navBtn.classList.add('btn-stop');
+            document.getElementById('hint-text').innerText = 'Режим навігації активний';
+
+            if (currentLat && currentLng) {
+                map.setView([currentLat, currentLng], 18, { animate: true });
+            }
+        } else {
+            resetNavigationState();
+        }
+    }
+
+    // --- Логіка пошуку адреси (OpenStreetMap Nominatim) ---
+    const searchInput = document.getElementById('search-input');
+    const searchResults = document.getElementById('search-results');
+
+    searchInput.addEventListener('input', function() {
+        const query = this.value.trim();
+        clearTimeout(searchDebounceTimer);
+
+        if (query.length < 3) {
+            searchResults.style.display = 'none';
+            searchResults.innerHTML = '';
+            return;
+        }
+
+        searchDebounceTimer = setTimeout(() => {
+            fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=5&accept-language=uk`)
+                .then(response => response.json())
+                .then(data => {
+                    searchResults.innerHTML = '';
+                    if (data.length === 0) {
+                        searchResults.style.display = 'none';
+                        return;
+                    }
+
+                    data.forEach(item => {
+                        const div = document.createElement('div');
+                        div.className = 'search-item';
+                        div.innerText = item.display_name;
+                        div.addEventListener('click', () => {
+                            const latLng = L.latLng(parseFloat(item.lat), parseFloat(item.lon));
+                            searchInput.value = item.display_name;
+                            searchResults.style.display = 'none';
+
+                            map.setView(latLng, 16, { animate: true });
+                            if (!isNavigationActive) {
+                                buildRoute(latLng);
+                            }
+                        });
+                        searchResults.appendChild(div);
+                    });
+
+                    searchResults.style.display = 'block';
+                })
+                .catch(err => {
+                    console.error('Помилка завантаження геокодингу:', err);
+                });
+        }, 350);
+    });
+
+    document.addEventListener('click', function(e) {
+        if (!document.getElementById('search-container').contains(e.target)) {
+            searchResults.style.display = 'none';
+        }
+    });
+
+    map.on('click', function(e) {
+        if (!isNavigationActive) {
+            buildRoute(e.latlng);
+        }
+    });
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    let ws = new WebSocket(wsUrl);
+
+    ws.onopen = function() {
+        document.getElementById('status-dot').className = 'status-dot status-online';
+        document.getElementById('status-text').innerText = 'Онлайн (Сервер активний)';
+    };
+
+    ws.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        if (data.lat && data.lng) {
+            document.getElementById('accuracy-val').innerText = Math.round(data.accuracy);
+            updateUserPosition(data.lat, data.lng, data.accuracy, data.status);
+        }
+    };
+
+    ws.onclose = function() {
+        document.getElementById('status-dot').className = 'status-dot status-offline';
+        document.getElementById('status-text').innerText = 'Зв’язок втрачено';
+        setTimeout(() => { location.reload(); }, 3000);
+    };
+</script>
+
+</body>
+</html>
